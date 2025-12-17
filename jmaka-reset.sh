@@ -40,11 +40,12 @@ if [[ -d /var/www/jmaka ]]; then
   rm -rf /var/www/jmaka/*
 fi
 
-# 3) remove nginx snippet files
-rm -f /etc/nginx/snippets/jmaka-*.location.conf 2>/dev/null || true
-rm -f /etc/nginx/snippets/jmaka-*.conf 2>/dev/null || true
+# 3) remove injected include lines from vhosts (with backups)
+# IMPORTANT: backups must NOT be placed inside sites-enabled/ if your nginx uses `include .../*;`
+# (otherwise nginx will start loading the backup file too).
+NGINX_BK_DIR="/etc/nginx/jmaka-backups"
+mkdir -p "$NGINX_BK_DIR"
 
-# 4) remove injected include lines from vhosts (with backups)
 remove_include_from_tree() {
   local root="$1"
   [[ -d "$root" ]] || return 0
@@ -57,13 +58,18 @@ remove_include_from_tree() {
     fi
 
     ts="$(date +%Y%m%d-%H%M%S)"
-    cp -a "$file" "${file}.bak.${ts}"
+    base="$(basename "$file")"
+    cp -a "$file" "${NGINX_BK_DIR}/${base}.bak.${ts}"
     sed -i -E '/^[[:space:]]*include[[:space:]]+\/etc\/nginx\/snippets\/jmaka-.*\.location\.conf;/d' "$file"
   done < <(find "$root" -type f -name '*.conf' 2>/dev/null)
 }
 
 remove_include_from_tree /etc/nginx/sites-enabled
 remove_include_from_tree /etc/nginx/sites-available
+
+# 4) remove nginx snippet files (after removing includes)
+rm -f /etc/nginx/snippets/jmaka-*.location.conf 2>/dev/null || true
+rm -f /etc/nginx/snippets/jmaka-*.conf 2>/dev/null || true
 
 # 5) validate + reload nginx
 if command -v nginx >/dev/null 2>&1; then

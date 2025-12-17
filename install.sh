@@ -703,8 +703,12 @@ inject_include_into_vhost() {
   fi
 
   # Backup before editing
+  # IMPORTANT: do NOT create backup files inside sites-enabled/ if nginx includes `.../sites-enabled/*;`
+  # otherwise nginx will start loading the backup file too.
   ts="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$vhost_file" "${vhost_file}.bak.${ts}"
+  bk_dir="/etc/nginx/jmaka-backups"
+  mkdir -p "$bk_dir"
+  cp -a "$vhost_file" "${bk_dir}/$(basename "$vhost_file").bak.${ts}"
 
   # If already included anywhere, do nothing.
   if grep -qF "$include_line" "$vhost_file"; then
