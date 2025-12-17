@@ -523,6 +523,11 @@ nginx_snippet() {
 client_max_body_size 80m;
 location / {
     proxy_redirect off;
+
+    # Important: some vhosts use `proxy_intercept_errors on;` + `error_page 400 =404 ...`.
+    # That makes Jmaka validation errors look like nginx 404.
+    proxy_intercept_errors off;
+
     proxy_pass         http://127.0.0.1:${PORT};
     proxy_http_version 1.1;
     proxy_set_header   Upgrade \$http_upgrade;
@@ -549,6 +554,10 @@ location = ${prefix_no_slash} {
 location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
 
+    # Important: some vhosts use `proxy_intercept_errors on;` + `error_page 400 =404 ...`.
+    # That makes Jmaka validation errors look like nginx 404.
+    proxy_intercept_errors off;
+
     # base-path mode: app is configured with JMAKA_BASE_PATH=${prefix_no_slash}
     # so we MUST pass the full URI including the prefix to the upstream.
     # Therefore NO trailing slash in proxy_pass here.
@@ -574,6 +583,10 @@ location = ${prefix_no_slash} {
 
 location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
+
+    # Important: some vhosts use `proxy_intercept_errors on;` + `error_page 400 =404 ...`.
+    # That makes Jmaka validation errors look like nginx 404.
+    proxy_intercept_errors off;
 
     # strip-prefix mode: nginx removes the prefix before proxying.
     # Therefore proxy_pass MUST have a trailing slash.
