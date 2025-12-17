@@ -8,33 +8,43 @@ set -euo pipefail
 # 3) Backup/Restore nginx config
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW_BASE="https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main"
 
-die_missing() {
-  local f="$1"
-  if [[ ! -f "$f" ]]; then
-    echo "ERROR: required file not found: $f" >&2
-    echo "Re-download scripts or run from the same directory." >&2
+ensure_file() {
+  local name="$1"
+  local dest="${SCRIPT_DIR}/${name}"
+
+  if [[ -f "$dest" ]]; then
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl is required to download missing helper scripts." >&2
     exit 1
   fi
+
+  echo "Downloading missing script: ${name}"
+  curl -fsSL -o "$dest" "${RAW_BASE}/${name}"
+  chmod +x "$dest" || true
 }
 
 run_install() {
-  die_missing "${SCRIPT_DIR}/install.sh"
+  ensure_file "install.sh"
   bash "${SCRIPT_DIR}/install.sh" --interactive
 }
 
 run_reset() {
-  die_missing "${SCRIPT_DIR}/jmaka-reset.sh"
+  ensure_file "jmaka-reset.sh"
   bash "${SCRIPT_DIR}/jmaka-reset.sh"
 }
 
 run_nginx_backup() {
-  die_missing "${SCRIPT_DIR}/nginx-backup.sh"
+  ensure_file "nginx-backup.sh"
   bash "${SCRIPT_DIR}/nginx-backup.sh"
 }
 
 run_nginx_restore() {
-  die_missing "${SCRIPT_DIR}/nginx-restore.sh"
+  ensure_file "nginx-restore.sh"
   local p=""
   echo "Enter path to nginx backup tar.gz (created by nginx-backup.sh):"
   read -r -p "> " p
