@@ -535,13 +535,21 @@ location / {
 }
 NGINX
   else
+    # Also redirect /prefix (no trailing slash) -> /prefix/ so users can type short URLs.
+    prefix_no_slash="${PATH_PREFIX%/}"
+
     if [[ "$MOUNT_MODE" == "basepath" ]]; then
       cat <<NGINX
 client_max_body_size 80m;
+
+location = ${prefix_no_slash} {
+    return 301 ${PATH_PREFIX};
+}
+
 location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
 
-    # base-path mode: app is configured with JMAKA_BASE_PATH=${PATH_PREFIX%/}
+    # base-path mode: app is configured with JMAKA_BASE_PATH=${prefix_no_slash}
     # so we MUST pass the full URI including the prefix to the upstream.
     # Therefore NO trailing slash in proxy_pass here.
     proxy_pass         http://127.0.0.1:${PORT};
@@ -559,6 +567,11 @@ NGINX
     else
       cat <<NGINX
 client_max_body_size 80m;
+
+location = ${prefix_no_slash} {
+    return 301 ${PATH_PREFIX};
+}
+
 location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
 
@@ -626,28 +639,58 @@ select_nginx_vhost_file() {
   fi
 
   if [[ -z "$matches" ]]; then
-    echo "";
+    echo ""
     return 0
   fi
 
-  # If multiple, pick first unless interactive.
+  # If multiple matches, prefer HTTPS vhost (listen 443 ... ssl) if present.
+  best=""
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+
+    # Score heuristic:
+    # 2 = has listen 443 and ssl
+    # 1 = has listen 443
+    # 0 = otherwise
+    score=0
+    if grep -qE '^[[:space:]]*listen[[:space:]]+\[?::\]?\s*443\b' "$f"; then
+      score=1
+      if grep -qE '^[[:space:]]*listen[[:space:]]+.*\b443\b.*\bssl\b' "$f"; then
+        score=2
+      fi
+    fi
+
+    if [[ -z "$best" || "$score" -gt "$best_score" ]]; then
+      best="$f"
+      best_score="$score"
+    fi
+  done <<<"$matches"
+
+  # If interactive and multiple, ask (but show best as default).
   if [[ "$INTERACTIVE" -eq 1 ]]; then
     count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
     if [[ "$count" -gt 1 ]]; then
       echo "Multiple nginx vhost files match domain '${NGINX_DOMAIN}':" >&2
+      echo "(Tip: for HTTPS routing you usually want the 443/ssl vhost)" >&2
       i=1
+      def=1
       while IFS= read -r f; do
-        echo "  ${i}) ${f}" >&2
+        mark=""
+        if [[ "$f" == "$best" ]]; then
+          mark=" (recommended)"
+          def="$i"
+        fi
+        echo "  ${i}) ${f}${mark}" >&2
         i=$((i+1))
       done <<<"$matches"
-      read -r -p "Choose [1-${count}] (default 1): " pick
-      if [[ -z "$pick" ]]; then pick=1; fi
+      read -r -p "Choose [1-${count}] (default ${def}): " pick
+      if [[ -z "$pick" ]]; then pick="$def"; fi
       echo "$(printf '%s\n' "$matches" | sed -n "${pick}p")"
       return 0
     fi
   fi
 
-  echo "$(printf '%s\n' "$matches" | head -n 1)"
+  echo "$best"
 }
 
 inject_include_into_vhost() {
