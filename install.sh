@@ -643,21 +643,26 @@ select_nginx_vhost_file() {
     return 0
   fi
 
-  # If multiple matches, prefer HTTPS vhost (listen 443 ... ssl) if present.
+  # If multiple matches, prefer HTTPS vhost (ssl) if present.
+  # Many setups use non-standard TLS ports (e.g. 7443 with proxy_protocol), so we score 443 and 7443.
   best=""
+  best_score=-1
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
 
     # Score heuristic:
-    # 2 = has listen 443 and ssl
-    # 1 = has listen 443
-    # 0 = otherwise
+    # +2 if has listen 443/7443 with ssl
+    # +1 if has listen 443/7443 without ssl
+    # +1 extra if the ssl listen line also has proxy_protocol
     score=0
-    if grep -qE '^[[:space:]]*listen[[:space:]]+\[?::\]?\s*443\b' "$f"; then
-      score=1
-      if grep -qE '^[[:space:]]*listen[[:space:]]+.*\b443\b.*\bssl\b' "$f"; then
-        score=2
+
+    if grep -qE '^[[:space:]]*listen[[:space:]]+.*\b(443|7443)\b.*\bssl\b' "$f"; then
+      score=$((score + 2))
+      if grep -qE '^[[:space:]]*listen[[:space:]]+.*\b(443|7443)\b.*\bssl\b.*\bproxy_protocol\b' "$f"; then
+        score=$((score + 1))
       fi
+    elif grep -qE '^[[:space:]]*listen[[:space:]]+.*\b(443|7443)\b' "$f"; then
+      score=$((score + 1))
     fi
 
     if [[ -z "$best" || "$score" -gt "$best_score" ]]; then
@@ -671,7 +676,7 @@ select_nginx_vhost_file() {
     count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
     if [[ "$count" -gt 1 ]]; then
       echo "Multiple nginx vhost files match domain '${NGINX_DOMAIN}':" >&2
-      echo "(Tip: for HTTPS routing you usually want the 443/ssl vhost)" >&2
+      echo "(Tip: for HTTPS routing you usually want the ssl vhost, e.g. listen 443/7443 ssl)" >&2
       i=1
       def=1
       while IFS= read -r f; do
