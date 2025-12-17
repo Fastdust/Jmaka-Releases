@@ -66,6 +66,45 @@ prompt_default() {
   printf -v "${__var}" '%s' "${__val}"
 }
 
+sanitize_instance_name() {
+  # systemd unit names and Linux paths are much safer with ASCII only.
+  # Keep: a-z, 0-9, dash. Convert to lowercase, replace anything else with dash, trim dashes.
+  local raw="$1"
+
+  # Lowercase (ASCII only)
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+
+  # Replace non [a-z0-9-] with '-'
+  raw="$(printf '%s' "$raw" | sed -E 's/[^a-z0-9-]+/-/g')"
+
+  # Trim leading/trailing '-'
+  raw="$(printf '%s' "$raw" | sed -E 's/^-+//; s/-+$//')"
+
+  # Collapse multiple '-'
+  raw="$(printf '%s' "$raw" | sed -E 's/-{2,}/-/g')"
+
+  # Limit length
+  raw="$(printf '%s' "$raw" | cut -c1-40)"
+
+  echo "$raw"
+}
+
+ensure_safe_instance_name() {
+  local before="$NAME"
+  local after
+  after="$(sanitize_instance_name "$before")"
+
+  if [[ -z "$after" ]]; then
+    echo "ERROR: instance name is empty or invalid. Use latin letters/numbers, e.g. jmaka-test" >&2
+    exit 1
+  fi
+
+  if [[ "$after" != "$before" ]]; then
+    echo "NOTE: instance name normalized: '$before' -> '$after'" >&2
+    NAME="$after"
+  fi
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "ERROR: please run as root (use sudo)." >&2
@@ -236,7 +275,8 @@ done
 
 if [[ "$INTERACTIVE" -eq 1 ]]; then
   echo "Interactive setup:"
-  prompt_default NAME "Instance name" "$NAME"
+  prompt_default NAME "Instance name (latin letters/numbers recommended)" "$NAME"
+  ensure_safe_instance_name
 
   print_used_ports_hint
   _suggested_port=""
@@ -322,6 +362,8 @@ if [[ -z "$NAME" ]]; then
   echo "ERROR: --name is required" >&2
   exit 1
 fi
+
+ensure_safe_instance_name
 
 # Default base dir is /var/www/jmaka/<name> (one directory per instance)
 if [[ -z "$BASE_DIR" ]]; then
