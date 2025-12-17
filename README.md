@@ -19,7 +19,15 @@ curl -L -o ~/jmaka.tar.gz \
 - Если нужно установить в подпапку (например `/jmaka/` на существующем домене) — выберите `path prefix` в мастере.
   - Режим `base-path` (рекомендуется): приложение получает URI с префиксом `/jmaka`, nginx `proxy_pass` без завершающего `/`.
   - Режим `strip-prefix` (legacy): nginx отрезает `/jmaka` (в `proxy_pass` есть завершающий `/`), приложение работает как на корне `/`.
-- Перед установкой мастер предлагает очистить следы прошлых установок (по инстансу или все сразу).
+- Режим nginx `AUTO` (по умолчанию) сам:
+  - создаёт snippet `/etc/nginx/snippets/jmaka-<name>.location.conf`
+  - добавляет `include ...` в существующий vhost домена
+  - использует `location ^~ /jmaka/ { ... }`, чтобы не ловить 404 на `/jmaka/crop`
+
+## Служебные скрипты
+- `nginx-backup.sh` — простой бэкап `/etc/nginx` в `~/jmaka-backups/nginx/`.
+- `nginx-restore.sh` — восстановление `/etc/nginx` из tar.gz бэкапа.
+- `jmaka-reset.sh` — удалить все инстансы Jmaka и убрать внесённые include/snippet (с бэкапами изменяемых файлов).
 
 ## Assets
 - `jmaka-linux-x64.tar.gz` — linux-x64 архив приложения (framework-dependent), который прикрепляется к каждому релизу как стабильное имя для `releases/latest/download/...`.

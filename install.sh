@@ -9,19 +9,21 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exec sudo -E JMAKA_ORIG_USER="${USER:-}" JMAKA_ORIG_HOME="${HOME:-}" bash "$0" "$@"
 fi
 
-# Jmaka Ubuntu 24 installer (wizard-friendly)
+# Jmaka installer (wizard-friendly)
 # What it does:
 # - installs ASP.NET Core Runtime 10 into /opt/dotnet (if missing)
 # - unpacks the app bundle to /var/www/jmaka/<name>/app
-# - stores data in /var/www/jmaka/<name>/storage (upload/resized/preview/data)
+# - stores data in /var/www/jmaka/<name>/storage
 # - creates and starts a systemd service listening on 127.0.0.1:<port>
-# - can print OR write an nginx snippet/vhost file (optional)
+# - nginx integration:
+#     * AUTO (default): writes a snippet + injects an `include ...` into your existing vhost for the domain
+#     * or prints a snippet for manual paste
 #
 # Usage:
-# - interactive (recommended for first time):
-#     sudo bash deploy/ubuntu24/install.sh
+# - interactive (recommended):
+#     bash install.sh --interactive
 # - non-interactive:
-#     sudo bash deploy/ubuntu24/install.sh --name a --port 5010 --tar /var/www/jmaka/_bundles/jmaka.tar.gz --domain a.example.com --path-prefix /
+#     bash install.sh --name jmaka --port 5010 --tar /root/jmaka.tar.gz --domain example.com --path-prefix /jmaka/ --mount-mode basepath --nginx-action auto
 
 # Identify original (non-root) user/home (important when running via sudo)
 ORIG_USER="${JMAKA_ORIG_USER:-${SUDO_USER:-${USER:-}}}"
@@ -48,22 +50,16 @@ INTERACTIVE=0
 # - strip (legacy): nginx strips /jmaka, app runs at /
 MOUNT_MODE="basepath"  # basepath|strip
 
-# Cleanup mode:
-# - none: do nothing
-# - instance: stop/disable old unit for this instance + clear app dir
-# - all: remove ALL jmaka-* units and /var/www/jmaka/* (requires typing DELETE)
-CLEANUP_MODE="instance" # none|instance|all
-
 # Nginx integration
-NGINX_ACTION="print"   # none|print|write-snippet|write-vhost
+# - auto: writes a snippet and injects `include ...` into an existing vhost for the domain (recommended)
+# - print: prints snippet for manual paste
+# - write-snippet: only writes snippet file (manual include)
+# - none: don't touch nginx
+NGINX_ACTION="auto"   # none|auto|print|write-snippet
 NGINX_DOMAIN=""
-PATH_PREFIX="/"        # / or /something/
-TLS_LISTEN_PORT="443"  # 443, 7443, etc
-TLS_PROXY_PROTOCOL="0" # 0/1
-SSL_CERT=""
-SSL_KEY=""
-ENABLE_NGINX_SITE="0"  # 0/1 (only for write-vhost)
-RELOAD_NGINX="0"       # 0/1
+NGINX_VHOST_FILE=""   # optional explicit path for auto-mode
+PATH_PREFIX="/"       # / or /something/
+RELOAD_NGINX="1"      # 0/1
 
 prompt_default() {
   local __var="$1"; shift
@@ -153,70 +149,12 @@ is_url() {
   [[ "$s" == http://* || "$s" == https://* ]]
 }
 
-cleanup_instance() {
+stop_existing_service() {
   local service_name="$1"
-  local app_dir="$2"
-
   if systemctl list-unit-files 2>/dev/null | grep -qE "^${service_name}\.service"; then
-    echo "Stopping previous service: ${service_name}"
+    echo "Stopping existing service (safe reinstall): ${service_name}"
     systemctl stop "${service_name}" >/dev/null 2>&1 || true
-    systemctl disable "${service_name}" >/dev/null 2>&1 || true
   fi
-
-  # In case a previous attempt launched dotnet without systemd,
-  # try to stop the exact app process (best-effort).
-  if command -v pgrep >/dev/null 2>&1; then
-    pids="$(pgrep -f "${app_dir}/Jmaka.Api.dll" || true)"
-    if [[ -n "$pids" ]]; then
-      echo "Stopping stray Jmaka processes: $pids"
-      # shellcheck disable=SC2086
-      kill $pids >/dev/null 2>&1 || true
-    fi
-  fi
-
-  if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
-    echo "Removing previous unit: /etc/systemd/system/${service_name}.service"
-    rm -f "/etc/systemd/system/${service_name}.service"
-  fi
-
-  rm -f "/etc/systemd/system/multi-user.target.wants/${service_name}.service" 2>/dev/null || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  if [[ -d "$app_dir" ]]; then
-    echo "Cleaning previous app files: ${app_dir}/*"
-    rm -rf "${app_dir:?}"/*
-  fi
-}
-
-cleanup_all_jmaka() {
-  echo "WARNING: This will remove ALL jmaka-* systemd unit files and ALL instance dirs under /var/www/jmaka/."
-  echo "Type DELETE to continue:"
-  local confirm=""
-  read -r confirm
-  if [[ "$confirm" != "DELETE" ]]; then
-    echo "Cleanup cancelled."
-    return 0
-  fi
-
-  local f
-  for f in /etc/systemd/system/jmaka-*.service; do
-    [[ -e "$f" ]] || continue
-    local base
-    base="$(basename "$f")"
-    local svc="${base%.service}"
-    systemctl stop "$svc" >/dev/null 2>&1 || true
-    systemctl disable "$svc" >/dev/null 2>&1 || true
-    rm -f "$f"
-    rm -f "/etc/systemd/system/multi-user.target.wants/${svc}.service" 2>/dev/null || true
-  done
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  if [[ -d /var/www/jmaka ]]; then
-    rm -rf /var/www/jmaka/*
-  fi
-
-  echo "Global cleanup done."
 }
 
 download_bundle_if_url() {
@@ -271,7 +209,7 @@ ensure_packages() {
 }
 
 ensure_nginx_if_needed() {
-  if [[ "$RELOAD_NGINX" -ne 1 && "$NGINX_ACTION" != "write-snippet" && "$NGINX_ACTION" != "write-vhost" ]]; then
+  if [[ "$RELOAD_NGINX" -ne 1 && "$NGINX_ACTION" != "write-snippet" && "$NGINX_ACTION" != "auto" ]]; then
     return 0
   fi
 
@@ -360,16 +298,11 @@ while [[ $# -gt 0 ]]; do
     --base-dir) BASE_DIR="$2"; shift 2;;
 
     --domain) NGINX_DOMAIN="$2"; shift 2;;
+    --nginx-vhost-file) NGINX_VHOST_FILE="$2"; shift 2;;
     --path-prefix) PATH_PREFIX="$2"; shift 2;;
     --mount-mode) MOUNT_MODE="$2"; shift 2;;
-    --cleanup) CLEANUP_MODE="$2"; shift 2;;
 
     --nginx-action) NGINX_ACTION="$2"; shift 2;;
-    --tls-listen-port) TLS_LISTEN_PORT="$2"; shift 2;;
-    --tls-proxy-protocol) TLS_PROXY_PROTOCOL="$2"; shift 2;;
-    --ssl-cert) SSL_CERT="$2"; shift 2;;
-    --ssl-key) SSL_KEY="$2"; shift 2;;
-    --enable-nginx-site) ENABLE_NGINX_SITE=1; shift 1;;
     --reload-nginx) RELOAD_NGINX=1; shift 1;;
 
     *) echo "Unknown arg: $1"; exit 2;;
@@ -382,19 +315,6 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
   ensure_safe_instance_name
 
   prompt_default BASE_DIR "Base dir for this instance" "${BASE_DIR:-/var/www/jmaka/${NAME}}"
-
-  echo "Cleanup previous installs?"
-  echo "  1) yes, cleanup this instance only (recommended)"
-  echo "  2) yes, cleanup ALL jmaka installs (DANGEROUS)"
-  echo "  3) no"
-  read -r -p "Choose [1-3] (default 1): " _cl
-  if [[ -z "${_cl}" || "${_cl}" == "1" ]]; then
-    CLEANUP_MODE="instance"
-  elif [[ "${_cl}" == "2" ]]; then
-    CLEANUP_MODE="all"
-  else
-    CLEANUP_MODE="none"
-  fi
 
   print_used_ports_hint
   _suggested_port=""
@@ -442,48 +362,26 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
     fi
   fi
 
-  prompt_default TLS_LISTEN_PORT "Nginx TLS listen port (443, 7443, ...)" "${TLS_LISTEN_PORT}"
-
-  echo "Use proxy_protocol on the listen line?"
-  echo "  0) no"
-  echo "  1) yes"
-  read -r -p "Choose [0-1] (default ${TLS_PROXY_PROTOCOL}): " _pp
-  if [[ -n "${_pp}" ]]; then TLS_PROXY_PROTOCOL="${_pp}"; fi
-
-  # Default LetsEncrypt paths for convenience
-  if [[ -z "$SSL_CERT" ]]; then
-    SSL_CERT="/etc/letsencrypt/live/${NGINX_DOMAIN}/fullchain.pem"
-  fi
-  if [[ -z "$SSL_KEY" ]]; then
-    SSL_KEY="/etc/letsencrypt/live/${NGINX_DOMAIN}/privkey.pem"
-  fi
-  prompt_default SSL_CERT "ssl_certificate" "$SSL_CERT"
-  prompt_default SSL_KEY "ssl_certificate_key" "$SSL_KEY"
-
   echo "Nginx automation:"
-  echo "  1) Just PRINT config/snippet (recommended)"
-  echo "  2) WRITE snippet file (/etc/nginx/snippets/jmaka-<name>.conf)"
-  echo "  3) WRITE full vhost file (/etc/nginx/sites-available/jmaka-<name>.conf)"
+  echo "  1) AUTO (recommended): write snippet + inject include into your existing vhost"
+  echo "  2) Just PRINT snippet (manual paste)"
+  echo "  3) WRITE snippet file only (manual include)"
   echo "  4) None"
   read -r -p "Choose [1-4] (default 1): " _na
   if [[ -z "${_na}" ]]; then _na="1"; fi
   case "${_na}" in
-    1) NGINX_ACTION="print";;
-    2) NGINX_ACTION="write-snippet";;
-    3) NGINX_ACTION="write-vhost";;
+    1) NGINX_ACTION="auto";;
+    2) NGINX_ACTION="print";;
+    3) NGINX_ACTION="write-snippet";;
     4) NGINX_ACTION="none";;
-    *) NGINX_ACTION="print";;
+    *) NGINX_ACTION="auto";;
   esac
 
-  if [[ "$NGINX_ACTION" == "write-vhost" ]]; then
-    echo "Enable this site (symlink to sites-enabled)?"
-    read -r -p "Enable? [y/N]: " _en
-    if [[ "${_en}" =~ ^[Yy]$ ]]; then ENABLE_NGINX_SITE=1; fi
+if [[ "$NGINX_ACTION" == "auto" ]]; then
+    echo "Reload nginx after changes?"
+    read -r -p "Reload nginx? [Y/n]: " _rn
+    if [[ -z "${_rn}" || "${_rn}" =~ ^[Yy]$ ]]; then RELOAD_NGINX=1; else RELOAD_NGINX=0; fi
   fi
-
-  echo "Reload nginx after changes?"
-  read -r -p "Reload nginx? [y/N]: " _rn
-  if [[ "${_rn}" =~ ^[Yy]$ ]]; then RELOAD_NGINX=1; fi
 fi
 
 PATH_PREFIX="$(normalize_path_prefix "$PATH_PREFIX")"
@@ -498,10 +396,6 @@ if [[ "$PATH_PREFIX" == "/" ]]; then
   MOUNT_MODE="basepath"
 fi
 
-if [[ "$CLEANUP_MODE" != "none" && "$CLEANUP_MODE" != "instance" && "$CLEANUP_MODE" != "all" ]]; then
-  echo "ERROR: --cleanup must be none|instance|all" >&2
-  exit 1
-fi
 
 if [[ -z "$NAME" ]]; then
   echo "ERROR: --name is required" >&2
@@ -515,19 +409,10 @@ if [[ -z "$BASE_DIR" ]]; then
   BASE_DIR="/var/www/jmaka/${NAME}"
 fi
 
-# ----- early cleanup (before port checks/packages) -----
-APP_DIR="${BASE_DIR}/app"
 SERVICE_NAME="jmaka-${NAME}"
+stop_existing_service "$SERVICE_NAME"
 
-require_cmd systemctl
-
-if [[ "$CLEANUP_MODE" == "all" ]]; then
-  cleanup_all_jmaka
-elif [[ "$CLEANUP_MODE" == "instance" ]]; then
-  cleanup_instance "$SERVICE_NAME" "$APP_DIR"
-fi
-
-# ----- validate port AFTER cleanup (cleanup may stop the old service) -----
+# ----- validate port -----
 if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --port must be a number" >&2
   exit 1
@@ -653,7 +538,7 @@ NGINX
     if [[ "$MOUNT_MODE" == "basepath" ]]; then
       cat <<NGINX
 client_max_body_size 80m;
-location ${PATH_PREFIX} {
+location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
 
     # base-path mode: app is configured with JMAKA_BASE_PATH=${PATH_PREFIX%/}
@@ -674,7 +559,7 @@ NGINX
     else
       cat <<NGINX
 client_max_body_size 80m;
-location ${PATH_PREFIX} {
+location ^~ ${PATH_PREFIX} {
     proxy_redirect off;
 
     # strip-prefix mode: nginx removes the prefix before proxying.
@@ -695,75 +580,132 @@ NGINX
   fi
 }
 
-write_nginx_snippet_file() {
+
+write_nginx_location_snippet_file() {
   ensure_nginx_if_needed
-  local snippet_path="/etc/nginx/snippets/jmaka-${NAME}.conf"
-  echo "Writing nginx snippet: ${snippet_path}"
-  mkdir -p /etc/nginx/snippets
-  nginx_snippet >"${snippet_path}"
-}
-
-write_nginx_vhost_file() {
-  ensure_nginx_if_needed
-
-  if [[ -z "$SSL_CERT" || -z "$SSL_KEY" ]]; then
-    echo "ERROR: ssl cert/key paths are required for write-vhost." >&2
-    exit 1
-  fi
-  if [[ ! -f "$SSL_CERT" ]]; then
-    echo "WARNING: ssl_certificate does not exist: $SSL_CERT" >&2
-  fi
-  if [[ ! -f "$SSL_KEY" ]]; then
-    echo "WARNING: ssl_certificate_key does not exist: $SSL_KEY" >&2
-  fi
-
-  local vhost_path="/etc/nginx/sites-available/jmaka-${NAME}.conf"
-  echo "Writing nginx vhost: ${vhost_path}"
-  mkdir -p /etc/nginx/sites-available
-
-  local listen_line="listen ${TLS_LISTEN_PORT} ssl http2"
-  local listen_line_v6="listen [::]:${TLS_LISTEN_PORT} ssl http2"
-  if [[ "$TLS_PROXY_PROTOCOL" == "1" ]]; then
-    listen_line="${listen_line} proxy_protocol"
-    listen_line_v6="${listen_line_v6} proxy_protocol"
-  fi
-
-  cat >"${vhost_path}" <<EOF
-server {
-    server_tokens off;
-
-    server_name ${NGINX_DOMAIN};
-    ${listen_line};
-    ${listen_line_v6};
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
-
-    ssl_certificate ${SSL_CERT};
-    ssl_certificate_key ${SSL_KEY};
-
-    # Optional hardening (matches your style)
-    if (\$host !~* ^(.+\.)?${NGINX_DOMAIN//./\.}\$ ) { return 444; }
-
-    include /etc/nginx/snippets/jmaka-${NAME}.location.conf;
-}
-EOF
-
-  # location snippet file (kept separate so you can reuse it inside existing vhosts too)
   local loc_path="/etc/nginx/snippets/jmaka-${NAME}.location.conf"
   echo "Writing nginx location snippet: ${loc_path}"
+  mkdir -p /etc/nginx/snippets
   nginx_snippet >"${loc_path}"
 }
 
-maybe_enable_site() {
-  if [[ "$ENABLE_NGINX_SITE" -ne 1 ]]; then
+auto_configure_nginx() {
+  if [[ -z "$NGINX_DOMAIN" || "$NGINX_DOMAIN" == "example.com" ]]; then
+    echo "ERROR: nginx auto-config requires a real domain (server_name)." >&2
+    exit 1
+  fi
+
+  write_nginx_location_snippet_file
+
+  local vhost_file="${NGINX_VHOST_FILE:-}" 
+  if [[ -z "$vhost_file" ]]; then
+    vhost_file="$(select_nginx_vhost_file)"
+  fi
+
+  if [[ -z "$vhost_file" ]]; then
+    echo "ERROR: could not find an existing nginx vhost for domain '${NGINX_DOMAIN}'." >&2
+    echo "Tip: run with --nginx-action print, or specify --nginx-vhost-file /path/to/vhost.conf" >&2
+    exit 1
+  fi
+
+  echo "Using nginx vhost file: ${vhost_file}"
+  inject_include_into_vhost "$vhost_file"
+
+  if [[ "$RELOAD_NGINX" -eq 1 ]]; then
+    maybe_reload_nginx
+  fi
+}
+
+select_nginx_vhost_file() {
+  # Find a vhost file that contains a server_name matching NGINX_DOMAIN.
+  # Prefer /etc/nginx/sites-enabled because that's what is active.
+  local matches
+  matches="$(grep -RIl --include='*.conf' -E "^[[:space:]]*server_name[[:space:]].*\b${NGINX_DOMAIN}\b" /etc/nginx/sites-enabled 2>/dev/null || true)"
+  if [[ -z "$matches" ]]; then
+    matches="$(grep -RIl --include='*.conf' -E "^[[:space:]]*server_name[[:space:]].*\b${NGINX_DOMAIN}\b" /etc/nginx/sites-available 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$matches" ]]; then
+    echo "";
     return 0
   fi
-  local vhost_path="/etc/nginx/sites-available/jmaka-${NAME}.conf"
-  local link_path="/etc/nginx/sites-enabled/jmaka-${NAME}.conf"
-  echo "Enabling site: ${link_path} -> ${vhost_path}"
-  mkdir -p /etc/nginx/sites-enabled
-  ln -sf "${vhost_path}" "${link_path}"
+
+  # If multiple, pick first unless interactive.
+  if [[ "$INTERACTIVE" -eq 1 ]]; then
+    count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+    if [[ "$count" -gt 1 ]]; then
+      echo "Multiple nginx vhost files match domain '${NGINX_DOMAIN}':" >&2
+      i=1
+      while IFS= read -r f; do
+        echo "  ${i}) ${f}" >&2
+        i=$((i+1))
+      done <<<"$matches"
+      read -r -p "Choose [1-${count}] (default 1): " pick
+      if [[ -z "$pick" ]]; then pick=1; fi
+      echo "$(printf '%s\n' "$matches" | sed -n "${pick}p")"
+      return 0
+    fi
+  fi
+
+  echo "$(printf '%s\n' "$matches" | head -n 1)"
+}
+
+inject_include_into_vhost() {
+  local vhost_file="$1"
+  local include_line="include /etc/nginx/snippets/jmaka-${NAME}.location.conf;"
+
+  if [[ ! -f "$vhost_file" ]]; then
+    echo "ERROR: nginx vhost file not found: $vhost_file" >&2
+    exit 1
+  fi
+
+  # Backup before editing
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$vhost_file" "${vhost_file}.bak.${ts}"
+
+  # If already included anywhere, do nothing.
+  if grep -qF "$include_line" "$vhost_file"; then
+    echo "Nginx vhost already includes jmaka snippet."
+    return 0
+  fi
+
+  tmp="${vhost_file}.tmp.${ts}"
+
+  awk -v domain="$NGINX_DOMAIN" -v inc="$include_line" '
+    function count_braces(s,  t, o, c) {
+      t=s; o=gsub(/\{/, "", t); t=s; c=gsub(/\}/, "", t); return o - c
+    }
+    BEGIN { in_server=0; depth=0; target=0; inserted=0 }
+    {
+      line=$0
+      if (!in_server && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+        in_server=1; depth=1; target=0; inserted=0
+        print line
+        next
+      }
+
+      if (in_server) {
+        if (!target && line ~ /^[[:space:]]*server_name[[:space:]].*;/ && line ~ domain) {
+          target=1
+          print line
+          if (!inserted) {
+            print "    " inc
+            inserted=1
+          }
+          depth += count_braces(line)
+          if (depth <= 0) { in_server=0 }
+          next
+        }
+
+        depth += count_braces(line)
+        if (depth <= 0) { in_server=0 }
+      }
+
+      print line
+    }
+  ' "$vhost_file" >"$tmp"
+
+  mv "$tmp" "$vhost_file"
 }
 
 maybe_reload_nginx() {
@@ -784,29 +726,23 @@ echo ""
 case "$NGINX_ACTION" in
   none)
     ;;
+  auto)
+    auto_configure_nginx
+    ;;
   print)
     echo "Nginx config to paste (domain: ${NGINX_DOMAIN}, prefix: ${PATH_PREFIX})"
     echo "Paste this INSIDE the existing server block."
-    echo "IMPORTANT: If you paste into a big config, put it ABOVE a catch-all 'location /' block."
+    echo "IMPORTANT: Put it ABOVE a catch-all 'location /' block, and use '^~' for /jmaka/."
     echo ""
     nginx_snippet
     ;;
   write-snippet)
-    write_nginx_snippet_file
-    maybe_reload_nginx
+    write_nginx_location_snippet_file
     echo ""
-    echo "Now include it in your server block: include /etc/nginx/snippets/jmaka-${NAME}.conf;"
+    echo "Now include it in your server block: include /etc/nginx/snippets/jmaka-${NAME}.location.conf;"
     echo "(Place the include above any catch-all location /)"
-    ;;
-  write-vhost)
-    write_nginx_vhost_file
-    maybe_enable_site
-    maybe_reload_nginx
-    echo ""
-    echo "Vhost created: /etc/nginx/sites-available/jmaka-${NAME}.conf"
-    if [[ "$ENABLE_NGINX_SITE" -ne 1 ]]; then
-      echo "To enable: ln -s /etc/nginx/sites-available/jmaka-${NAME}.conf /etc/nginx/sites-enabled/jmaka-${NAME}.conf"
-      echo "Then: nginx -t && systemctl reload nginx"
+    if [[ "$RELOAD_NGINX" -eq 1 ]]; then
+      maybe_reload_nginx
     fi
     ;;
   *)
