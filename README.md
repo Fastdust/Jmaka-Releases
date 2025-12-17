@@ -3,11 +3,11 @@
 Этот репозиторий публичный и предназначен только для удобного скачивания релизов Jmaka одной командой.
 
 ## Установка на Ubuntu 24 (одной командой)
-Пример для релиза **0.1.0b**:
+Команда всегда скачивает *последний* релиз:
 
 ```bash
 curl -L -o ~/jmaka.tar.gz \
-  https://github.com/Fastdust/Jmaka-Releases/releases/download/0.1.0b/jmaka-0.1.0b-linux-x64.tar.gz \
+  https://github.com/Fastdust/Jmaka-Releases/releases/latest/download/jmaka-linux-x64.tar.gz \
 && curl -L -o ~/jmaka-install.sh \
   https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/install.sh \
 && bash ~/jmaka-install.sh --interactive
@@ -19,7 +19,7 @@ curl -L -o ~/jmaka.tar.gz \
 - Если нужно установить в подпапку (например `/jmaka/` на существующем домене) — выберите соответствующий `path prefix` в мастере.
 
 ## Assets
-- `jmaka-0.1.0b-linux-x64.tar.gz` — linux-x64 архив приложения (framework-dependent).
+- `jmaka-linux-x64.tar.gz` — linux-x64 архив приложения (framework-dependent), который прикрепляется к каждому релизу как стабильное имя для `releases/latest/download/...`.
 
 ## Security
 Основной код приложения может быть в приватном репозитории. Этот репозиторий содержит только установщик и опубликованные артефакты.
