@@ -163,6 +163,17 @@ cleanup_instance() {
     systemctl disable "${service_name}" >/dev/null 2>&1 || true
   fi
 
+  # In case a previous attempt launched dotnet without systemd,
+  # try to stop the exact app process (best-effort).
+  if command -v pgrep >/dev/null 2>&1; then
+    pids="$(pgrep -f "${app_dir}/Jmaka.Api.dll" || true)"
+    if [[ -n "$pids" ]]; then
+      echo "Stopping stray Jmaka processes: $pids"
+      # shellcheck disable=SC2086
+      kill $pids >/dev/null 2>&1 || true
+    fi
+  fi
+
   if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
     echo "Removing previous unit: /etc/systemd/system/${service_name}.service"
     rm -f "/etc/systemd/system/${service_name}.service"
@@ -370,6 +381,21 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
   prompt_default NAME "Instance name (slug, NOT a path)" "$NAME"
   ensure_safe_instance_name
 
+  prompt_default BASE_DIR "Base dir for this instance" "${BASE_DIR:-/var/www/jmaka/${NAME}}"
+
+  echo "Cleanup previous installs?"
+  echo "  1) yes, cleanup this instance only (recommended)"
+  echo "  2) yes, cleanup ALL jmaka installs (DANGEROUS)"
+  echo "  3) no"
+  read -r -p "Choose [1-3] (default 1): " _cl
+  if [[ -z "${_cl}" || "${_cl}" == "1" ]]; then
+    CLEANUP_MODE="instance"
+  elif [[ "${_cl}" == "2" ]]; then
+    CLEANUP_MODE="all"
+  else
+    CLEANUP_MODE="none"
+  fi
+
   print_used_ports_hint
   _suggested_port=""
   _suggested_port="$(suggest_free_port || true)"
@@ -398,9 +424,8 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
     break
   done
 
-prompt_default APP_TAR "Path to app bundle (.tar.gz)" "$APP_TAR"
+  prompt_default APP_TAR "Path to app bundle (.tar.gz)" "$APP_TAR"
   APP_TAR="$(expand_user_path "$APP_TAR")"
-  prompt_default BASE_DIR "Base dir for this instance" "${BASE_DIR:-/var/www/jmaka/${NAME}}"
   prompt_default NGINX_DOMAIN "Domain/subdomain" "${NGINX_DOMAIN:-example.com}"
   prompt_default PATH_PREFIX "Path prefix (use / for root, or /jmaka/)" "${PATH_PREFIX}"
 
@@ -415,19 +440,6 @@ prompt_default APP_TAR "Path to app bundle (.tar.gz)" "$APP_TAR"
     else
       MOUNT_MODE="strip"
     fi
-  fi
-
-  echo "Cleanup previous installs?"
-  echo "  1) yes, cleanup this instance only (recommended)"
-  echo "  2) yes, cleanup ALL jmaka installs (DANGEROUS)"
-  echo "  3) no"
-  read -r -p "Choose [1-3] (default 1): " _cl
-  if [[ -z "${_cl}" || "${_cl}" == "1" ]]; then
-    CLEANUP_MODE="instance"
-  elif [[ "${_cl}" == "2" ]]; then
-    CLEANUP_MODE="all"
-  else
-    CLEANUP_MODE="none"
   fi
 
   prompt_default TLS_LISTEN_PORT "Nginx TLS listen port (443, 7443, ...)" "${TLS_LISTEN_PORT}"
@@ -503,6 +515,19 @@ if [[ -z "$BASE_DIR" ]]; then
   BASE_DIR="/var/www/jmaka/${NAME}"
 fi
 
+# ----- early cleanup (before port checks/packages) -----
+APP_DIR="${BASE_DIR}/app"
+SERVICE_NAME="jmaka-${NAME}"
+
+require_cmd systemctl
+
+if [[ "$CLEANUP_MODE" == "all" ]]; then
+  cleanup_all_jmaka
+elif [[ "$CLEANUP_MODE" == "instance" ]]; then
+  cleanup_instance "$SERVICE_NAME" "$APP_DIR"
+fi
+
+# ----- validate port AFTER cleanup (cleanup may stop the old service) -----
 if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --port must be a number" >&2
   exit 1
@@ -519,7 +544,6 @@ if is_port_used "$PORT"; then
 fi
 
 # If --tar is a URL, download it to the default local path.
-# (We do this after port validation, but before checking file existence.)
 if is_url "$APP_TAR"; then
   download_bundle_if_url "$APP_TAR" "${ORIG_HOME}/jmaka.tar.gz"
 fi
@@ -554,13 +578,6 @@ DATA_DIR="${BASE_DIR}/storage"
 mkdir -p "$APP_DIR" "$DATA_DIR"
 
 SERVICE_NAME="jmaka-${NAME}"
-
-# ----- cleanup (before unpack + unit write) -----
-if [[ "$CLEANUP_MODE" == "all" ]]; then
-  cleanup_all_jmaka
-elif [[ "$CLEANUP_MODE" == "instance" ]]; then
-  cleanup_instance "$SERVICE_NAME" "$APP_DIR"
-fi
 
 # App files are read-only and owned by root.
 chown -R root:root "$APP_DIR"
