@@ -8,9 +8,17 @@
 ```bash
 curl -L -o ~/jmaka.tar.gz \
   https://github.com/Fastdust/Jmaka-Releases/releases/latest/download/jmaka-linux-x64.tar.gz \
-&& curl -L -o ~/jmaka-install.sh \
+&& curl -L -o ~/jmaka.sh \
+  https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/jmaka.sh \
+&& curl -L -o ~/install.sh \
   https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/install.sh \
-&& bash ~/jmaka-install.sh --interactive
+&& curl -L -o ~/jmaka-reset.sh \
+  https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/jmaka-reset.sh \
+&& curl -L -o ~/nginx-backup.sh \
+  https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/nginx-backup.sh \
+&& curl -L -o ~/nginx-restore.sh \
+  https://raw.githubusercontent.com/Fastdust/Jmaka-Releases/main/nginx-restore.sh \
+&& bash ~/jmaka.sh
 ```
 
 Примечания:
