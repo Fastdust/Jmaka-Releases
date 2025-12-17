@@ -35,12 +35,24 @@ fi
 
 NAME="jmaka"
 PORT="5010"
+# Can be a local path or an https:// URL.
 # Default tarball location: user's home, so it can be downloaded without root.
 APP_TAR="${ORIG_HOME}/jmaka.tar.gz"
 BASE_DIR=""
 
 # Optional interactive mode (for non-technical users)
 INTERACTIVE=0
+
+# Mount mode for subpath (/jmaka/):
+# - basepath (recommended): app receives /jmaka/* and gets JMAKA_BASE_PATH=/jmaka
+# - strip (legacy): nginx strips /jmaka, app runs at /
+MOUNT_MODE="basepath"  # basepath|strip
+
+# Cleanup mode:
+# - none: do nothing
+# - instance: stop/disable old unit for this instance + clear app dir
+# - all: remove ALL jmaka-* units and /var/www/jmaka/* (requires typing DELETE)
+CLEANUP_MODE="instance" # none|instance|all
 
 # Nginx integration
 NGINX_ACTION="print"   # none|print|write-snippet|write-vhost
@@ -71,6 +83,12 @@ sanitize_instance_name() {
   # Keep: a-z, 0-9, dash. Convert to lowercase, replace anything else with dash, trim dashes.
   local raw="$1"
 
+  # obvious user error: people paste /var/www/... into instance name
+  if [[ "$raw" == /* || "$raw" == *"/"* || "$raw" == *"\\"* ]]; then
+    echo ""
+    return 0
+  fi
+
   # Lowercase (ASCII only)
   raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
 
@@ -84,7 +102,7 @@ sanitize_instance_name() {
   raw="$(printf '%s' "$raw" | sed -E 's/-{2,}/-/g')"
 
   # Limit length
-  raw="$(printf '%s' "$raw" | cut -c1-40)"
+  raw="$(printf '%s' "$raw" | cut -c1-48)"
 
   echo "$raw"
 }
@@ -95,7 +113,7 @@ ensure_safe_instance_name() {
   after="$(sanitize_instance_name "$before")"
 
   if [[ -z "$after" ]]; then
-    echo "ERROR: instance name is empty or invalid. Use latin letters/numbers, e.g. jmaka-test" >&2
+    echo "ERROR: instance name is invalid (or looks like a path). Use a slug like: jmaka, cholera-test" >&2
     exit 1
   fi
 
@@ -128,6 +146,78 @@ expand_user_path() {
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+is_url() {
+  local s="$1"
+  [[ "$s" == http://* || "$s" == https://* ]]
+}
+
+cleanup_instance() {
+  local service_name="$1"
+  local app_dir="$2"
+
+  if systemctl list-unit-files 2>/dev/null | grep -qE "^${service_name}\.service"; then
+    echo "Stopping previous service: ${service_name}"
+    systemctl stop "${service_name}" >/dev/null 2>&1 || true
+    systemctl disable "${service_name}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
+    echo "Removing previous unit: /etc/systemd/system/${service_name}.service"
+    rm -f "/etc/systemd/system/${service_name}.service"
+  fi
+
+  rm -f "/etc/systemd/system/multi-user.target.wants/${service_name}.service" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ -d "$app_dir" ]]; then
+    echo "Cleaning previous app files: ${app_dir}/*"
+    rm -rf "${app_dir:?}"/*
+  fi
+}
+
+cleanup_all_jmaka() {
+  echo "WARNING: This will remove ALL jmaka-* systemd unit files and ALL instance dirs under /var/www/jmaka/."
+  echo "Type DELETE to continue:"
+  local confirm=""
+  read -r confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    echo "Cleanup cancelled."
+    return 0
+  fi
+
+  local f
+  for f in /etc/systemd/system/jmaka-*.service; do
+    [[ -e "$f" ]] || continue
+    local base
+    base="$(basename "$f")"
+    local svc="${base%.service}"
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    systemctl disable "$svc" >/dev/null 2>&1 || true
+    rm -f "$f"
+    rm -f "/etc/systemd/system/multi-user.target.wants/${svc}.service" 2>/dev/null || true
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ -d /var/www/jmaka ]]; then
+    rm -rf /var/www/jmaka/*
+  fi
+
+  echo "Global cleanup done."
+}
+
+download_bundle_if_url() {
+  # If APP_TAR is a URL, download it to the given local path.
+  local src="$1"
+  local dst="$2"
+
+  if is_url "$src"; then
+    echo "Downloading app bundle to: $dst"
+    curl -fsSL "$src" -o "$dst"
+    APP_TAR="$dst"
+  fi
 }
 
 require_cmd() {
@@ -260,6 +350,8 @@ while [[ $# -gt 0 ]]; do
 
     --domain) NGINX_DOMAIN="$2"; shift 2;;
     --path-prefix) PATH_PREFIX="$2"; shift 2;;
+    --mount-mode) MOUNT_MODE="$2"; shift 2;;
+    --cleanup) CLEANUP_MODE="$2"; shift 2;;
 
     --nginx-action) NGINX_ACTION="$2"; shift 2;;
     --tls-listen-port) TLS_LISTEN_PORT="$2"; shift 2;;
@@ -275,7 +367,7 @@ done
 
 if [[ "$INTERACTIVE" -eq 1 ]]; then
   echo "Interactive setup:"
-  prompt_default NAME "Instance name (latin letters/numbers recommended)" "$NAME"
+  prompt_default NAME "Instance name (slug, NOT a path)" "$NAME"
   ensure_safe_instance_name
 
   print_used_ports_hint
@@ -311,6 +403,33 @@ prompt_default APP_TAR "Path to app bundle (.tar.gz)" "$APP_TAR"
   prompt_default BASE_DIR "Base dir for this instance" "${BASE_DIR:-/var/www/jmaka/${NAME}}"
   prompt_default NGINX_DOMAIN "Domain/subdomain" "${NGINX_DOMAIN:-example.com}"
   prompt_default PATH_PREFIX "Path prefix (use / for root, or /jmaka/)" "${PATH_PREFIX}"
+
+  PATH_PREFIX="$(normalize_path_prefix "$PATH_PREFIX")"
+  if [[ "$PATH_PREFIX" != "/" ]]; then
+    echo "Mount mode for subpath:"
+    echo "  1) base-path mode (recommended)  - app gets /jmaka/*, sets JMAKA_BASE_PATH=/jmaka"
+    echo "  2) strip-prefix mode (legacy)    - nginx removes /jmaka, app runs at /"
+    read -r -p "Choose [1-2] (default 1): " _mm
+    if [[ -z "${_mm}" || "${_mm}" == "1" ]]; then
+      MOUNT_MODE="basepath"
+    else
+      MOUNT_MODE="strip"
+    fi
+  fi
+
+  echo "Cleanup previous installs?"
+  echo "  1) yes, cleanup this instance only (recommended)"
+  echo "  2) yes, cleanup ALL jmaka installs (DANGEROUS)"
+  echo "  3) no"
+  read -r -p "Choose [1-3] (default 1): " _cl
+  if [[ -z "${_cl}" || "${_cl}" == "1" ]]; then
+    CLEANUP_MODE="instance"
+  elif [[ "${_cl}" == "2" ]]; then
+    CLEANUP_MODE="all"
+  else
+    CLEANUP_MODE="none"
+  fi
+
   prompt_default TLS_LISTEN_PORT "Nginx TLS listen port (443, 7443, ...)" "${TLS_LISTEN_PORT}"
 
   echo "Use proxy_protocol on the listen line?"
@@ -358,6 +477,20 @@ fi
 PATH_PREFIX="$(normalize_path_prefix "$PATH_PREFIX")"
 APP_TAR="$(expand_user_path "$APP_TAR")"
 
+if [[ "$MOUNT_MODE" != "basepath" && "$MOUNT_MODE" != "strip" ]]; then
+  echo "ERROR: --mount-mode must be basepath or strip" >&2
+  exit 1
+fi
+if [[ "$PATH_PREFIX" == "/" ]]; then
+  # no subpath, mount mode doesn't matter
+  MOUNT_MODE="basepath"
+fi
+
+if [[ "$CLEANUP_MODE" != "none" && "$CLEANUP_MODE" != "instance" && "$CLEANUP_MODE" != "all" ]]; then
+  echo "ERROR: --cleanup must be none|instance|all" >&2
+  exit 1
+fi
+
 if [[ -z "$NAME" ]]; then
   echo "ERROR: --name is required" >&2
   exit 1
@@ -385,9 +518,15 @@ if is_port_used "$PORT"; then
   exit 1
 fi
 
+# If --tar is a URL, download it to the default local path.
+# (We do this after port validation, but before checking file existence.)
+if is_url "$APP_TAR"; then
+  download_bundle_if_url "$APP_TAR" "${ORIG_HOME}/jmaka.tar.gz"
+fi
+
 if [[ ! -f "$APP_TAR" ]]; then
   echo "ERROR: app bundle not found at: $APP_TAR" >&2
-  echo "Download it first (recommended) to: ${ORIG_HOME}/jmaka.tar.gz" >&2
+  echo "Provide a local path OR an https:// URL. Recommended local path: ${ORIG_HOME}/jmaka.tar.gz" >&2
   exit 1
 fi
 
@@ -414,8 +553,17 @@ DATA_DIR="${BASE_DIR}/storage"
 
 mkdir -p "$APP_DIR" "$DATA_DIR"
 
+SERVICE_NAME="jmaka-${NAME}"
+
+# ----- cleanup (before unpack + unit write) -----
+if [[ "$CLEANUP_MODE" == "all" ]]; then
+  cleanup_all_jmaka
+elif [[ "$CLEANUP_MODE" == "instance" ]]; then
+  cleanup_instance "$SERVICE_NAME" "$APP_DIR"
+fi
+
 # App files are read-only and owned by root.
-chown -R root:root "$BASE_DIR"
+chown -R root:root "$APP_DIR"
 chmod -R a=rX "$APP_DIR"
 
 # Storage must be writable by the service user.
@@ -427,11 +575,9 @@ tar -xzf "$APP_TAR" -C "$APP_DIR"
 chown -R root:root "$APP_DIR"
 chmod -R a=rX "$APP_DIR"
 
-SERVICE_NAME="jmaka-${NAME}"
-
 # Base path for app: "/" or "/jmaka" (without trailing slash)
 BASE_PATH_ENV="/"
-if [[ "$PATH_PREFIX" != "/" ]]; then
+if [[ "$PATH_PREFIX" != "/" && "$MOUNT_MODE" == "basepath" ]]; then
   BASE_PATH_ENV="${PATH_PREFIX%/}"
 fi
 
@@ -487,12 +633,13 @@ location / {
 }
 NGINX
   else
-    cat <<NGINX
+    if [[ "$MOUNT_MODE" == "basepath" ]]; then
+      cat <<NGINX
 client_max_body_size 80m;
 location ${PATH_PREFIX} {
     proxy_redirect off;
 
-    # App is configured with JMAKA_BASE_PATH=${PATH_PREFIX%/}
+    # base-path mode: app is configured with JMAKA_BASE_PATH=${PATH_PREFIX%/}
     # so we MUST pass the full URI including the prefix to the upstream.
     # Therefore NO trailing slash in proxy_pass here.
     proxy_pass         http://127.0.0.1:${PORT};
@@ -507,6 +654,27 @@ location ${PATH_PREFIX} {
     proxy_set_header   X-Forwarded-Proto \$scheme;
 }
 NGINX
+    else
+      cat <<NGINX
+client_max_body_size 80m;
+location ${PATH_PREFIX} {
+    proxy_redirect off;
+
+    # strip-prefix mode: nginx removes the prefix before proxying.
+    # Therefore proxy_pass MUST have a trailing slash.
+    proxy_pass         http://127.0.0.1:${PORT}/;
+
+    proxy_http_version 1.1;
+    proxy_set_header   Upgrade \$http_upgrade;
+    proxy_set_header   Connection keep-alive;
+    proxy_set_header   Host \$host;
+    proxy_cache_bypass \$http_upgrade;
+    proxy_set_header   X-Real-IP \$remote_addr;
+    proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto \$scheme;
+}
+NGINX
+    fi
   fi
 }
 
